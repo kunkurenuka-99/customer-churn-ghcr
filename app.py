@@ -21,7 +21,7 @@ class Customer(BaseModel):
 
 @app.get("/")
 def root():
-    return {"message": "Customer Churn Prediction API is running", "version": "v1"}
+    return {"message": "Customer Churn Prediction API is running", "version": "v2"}
 
 
 @app.get("/health")
