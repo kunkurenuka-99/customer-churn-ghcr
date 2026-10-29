@@ -3,7 +3,7 @@ from pydantic import BaseModel
 import joblib
 import pandas as pd
 
-app = FastAPI(title="Customer Churn Prediction")
+app = FastAPI(title="Customer Churn Prediction v2")
 model = joblib.load("churn_model.joblib")
 
 
