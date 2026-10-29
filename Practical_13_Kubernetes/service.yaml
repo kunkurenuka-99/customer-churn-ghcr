@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: churn-prediction-service
+  labels:
+    app: churn-prediction
+spec:
+  type: NodePort
+  selector:
+    app: churn-prediction
+  ports:
+    - name: http
+      protocol: TCP
+      port: 80
+      targetPort: 8000
