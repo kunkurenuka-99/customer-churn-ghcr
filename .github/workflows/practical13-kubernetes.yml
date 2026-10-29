@@ -1,0 +1,222 @@
+name: Practical 13 - Kubernetes Deployment and Scaling
+
+on:
+  workflow_dispatch:
+    inputs:
+      package_name:
+        description: "GHCR package name (lowercase), e.g. churn-prediction"
+        required: true
+      old_tag:
+        description: "OLD image tag (initial deployment and rollback target)"
+        required: true
+      new_tag:
+        description: "NEW image tag (rolling update target)"
+        required: true
+
+permissions:
+  contents: read
+  packages: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  kubernetes-demo:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      PACKAGE: ${{ inputs.package_name }}
+      OLD_TAG: ${{ inputs.old_tag }}
+      NEW_TAG: ${{ inputs.new_tag }}
+      PAYLOAD: '{"gender":"Female","SeniorCitizen":0,"Partner":"Yes","Dependents":"No","tenure":1,"PhoneService":"No","MultipleLines":"No phone service","InternetService":"DSL","OnlineSecurity":"No"}'
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Prepare helpers and image names
+        run: |
+          OWNER="${GITHUB_REPOSITORY_OWNER,,}"
+          PKG="${PACKAGE,,}"
+          echo "OLD_IMAGE=ghcr.io/${OWNER}/${PKG}:${OLD_TAG}" >> "$GITHUB_ENV"
+          echo "NEW_IMAGE=ghcr.io/${OWNER}/${PKG}:${NEW_TAG}" >> "$GITHUB_ENV"
+
+          cat > /tmp/h.sh <<'EOF'
+          S="$GITHUB_STEP_SUMMARY"
+          h(){ { echo; echo "### $1"; echo '```'; } >> "$S"; echo "===== $1 ====="; }
+          e(){ echo '```' >> "$S"; }
+          run(){ echo "\$ $*" | tee -a "$S"; "$@" 2>&1 | tee -a "$S"; }
+          pf_start(){ kubectl port-forward svc/churn-prediction-service 8080:80 >/tmp/pf.log 2>&1 & PF=$!; sleep 6; }
+          pf_stop(){ kill "$PF" 2>/dev/null || true; }
+          test_api(){
+            echo "--- GET /health ---"
+            curl -sS -w '\nHTTP %{http_code}\n' localhost:8080/health
+            echo "--- GET /docs ---"
+            curl -sS -o /dev/null -w 'HTTP %{http_code}\n' localhost:8080/docs
+            echo "--- POST /predict ---"
+            curl -sS -w '\nHTTP %{http_code}\n' -X POST localhost:8080/predict -H 'Content-Type: application/json' -d "$PAYLOAD"
+            echo "--- GET /metrics ---"
+            curl -sS -o /dev/null -w 'HTTP %{http_code}\n' localhost:8080/metrics
+            curl -sS localhost:8080/metrics | grep '^churn_api_' | head -n 8 || true
+          }
+          EOF
+
+          source /tmp/h.sh
+          h "Images used"
+          echo "OLD image : ${OLD_IMAGE:-ghcr.io/${OWNER}/${PKG}:${OLD_TAG}}" | tee -a "$S"
+          echo "NEW image : ghcr.io/${OWNER}/${PKG}:${NEW_TAG}" | tee -a "$S"
+          e
+
+      - name: Step 2 - Start Minikube cluster
+        uses: medyagh/setup-minikube@latest
+        with:
+          driver: docker
+
+      - name: Step 3 - Verify cluster (node Ready)
+        run: |
+          source /tmp/h.sh
+          h "Step 3 - Cluster verification"
+          run minikube version
+          run kubectl cluster-info
+          run kubectl get nodes -o wide
+          run kubectl config current-context
+          e
+
+      - name: Step 6 - Registry access for GHCR (no token printed)
+        env:
+          GH_TOKEN_VALUE: ${{ secrets.GITHUB_TOKEN }}
+          GH_USER: ${{ github.actor }}
+        run: |
+          source /tmp/h.sh
+          h "Step 6 - ghcr-secret (token hidden)"
+          kubectl create secret docker-registry ghcr-secret \
+            --docker-server=ghcr.io \
+            --docker-username="$GH_USER" \
+            --docker-password="$GH_TOKEN_VALUE" \
+            --docker-email="noreply@github.com" > /dev/null
+          kubectl patch serviceaccount default -p '{"imagePullSecrets":[{"name":"ghcr-secret"}]}' > /dev/null
+          run kubectl get secret ghcr-secret
+          e
+
+      - name: Steps 9-11 - Deploy Deployment and Service
+        run: |
+          source /tmp/h.sh
+          cd Practical_13_Kubernetes
+          sed -E "s|^([[:space:]]*image:).*|\1 ${OLD_IMAGE}|" deployment.yaml > /tmp/deployment.yaml
+          h "Steps 9-11 - Apply manifests"
+          run grep -n "image:" /tmp/deployment.yaml
+          run kubectl apply -f /tmp/deployment.yaml
+          run kubectl apply -f service.yaml
+          run kubectl rollout status deployment/churn-prediction --timeout=240s
+          run kubectl get deployments
+          run kubectl get pods -o wide
+          run kubectl get services
+          run kubectl describe deployment churn-prediction
+          e
+
+      - name: Steps 12-13 - Test /health /docs /predict /metrics
+        run: |
+          source /tmp/h.sh
+          h "Steps 12-13 - API tests through the Kubernetes Service (OLD image)"
+          pf_start
+          test_api 2>&1 | tee -a "$S"
+          pf_stop
+          e
+
+      - name: Step 14 - Application logs from the Pod
+        run: |
+          source /tmp/h.sh
+          h "Step 14 - kubectl logs"
+          POD=$(kubectl get pods -l app=churn-prediction -o jsonpath='{.items[0].metadata.name}')
+          run kubectl get pods
+          run kubectl logs "$POD" --tail=40
+          e
+
+      - name: Steps 15-16 - Scale to 3 replicas and check backends
+        run: |
+          source /tmp/h.sh
+          h "Steps 15-16 - Scale to 3"
+          run kubectl scale deployment churn-prediction --replicas=3
+          run kubectl wait --for=jsonpath='{.status.readyReplicas}'=3 deployment/churn-prediction --timeout=240s
+          run kubectl get deployment churn-prediction
+          run kubectl get pods -o wide
+          run kubectl get endpointslice -l kubernetes.io/service-name=churn-prediction-service -o wide
+          e
+
+      - name: Steps 17-18 - Self-healing (delete one Pod)
+        run: |
+          source /tmp/h.sh
+          h "Steps 17-18 - Self-healing"
+          run kubectl get pods
+          POD=$(kubectl get pods -l app=churn-prediction -o jsonpath='{.items[0].metadata.name}')
+          echo "Deleting Pod: $POD" | tee -a "$S"
+          run kubectl delete pod "$POD" --wait=false
+          run kubectl get pods
+          sleep 5
+          run kubectl get pods
+          run kubectl wait --for=jsonpath='{.status.readyReplicas}'=3 deployment/churn-prediction --timeout=240s
+          run kubectl get pods -o wide
+          pf_start
+          test_api 2>&1 | tee -a "$S"
+          pf_stop
+          e
+
+      - name: Steps 19-21 - Rolling update to NEW image
+        run: |
+          source /tmp/h.sh
+          h "Steps 19-21 - Rolling update"
+          echo "OLD: $OLD_IMAGE" | tee -a "$S"
+          echo "NEW: $NEW_IMAGE" | tee -a "$S"
+          run kubectl set image deployment/churn-prediction churn-api="$NEW_IMAGE"
+          run kubectl get pods
+          run kubectl rollout status deployment/churn-prediction --timeout=300s
+          run kubectl get deployment churn-prediction -o wide
+          run kubectl rollout history deployment/churn-prediction
+          run kubectl get pods -o wide
+          pf_start
+          test_api 2>&1 | tee -a "$S"
+          pf_stop
+          e
+
+      - name: Step 22 - Rollback to previous revision
+        run: |
+          source /tmp/h.sh
+          h "Step 22 - Rollback"
+          run kubectl rollout undo deployment/churn-prediction
+          run kubectl rollout status deployment/churn-prediction --timeout=300s
+          run kubectl rollout history deployment/churn-prediction
+          echo -n "Active image after rollback: " | tee -a "$S"
+          kubectl get deployment churn-prediction -o jsonpath='{.spec.template.spec.containers[0].image}' | tee -a "$S"
+          echo | tee -a "$S"
+          e
+
+      - name: Step 23 - Scale back to 1 replica
+        run: |
+          source /tmp/h.sh
+          h "Step 23 - Scale down"
+          run kubectl scale deployment churn-prediction --replicas=1
+          sleep 10
+          run kubectl get pods
+          run kubectl get deployment churn-prediction
+          e
+
+      - name: Step 24 - Optional resource usage
+        continue-on-error: true
+        run: |
+          source /tmp/h.sh
+          h "Step 24 - Resource usage (optional)"
+          run minikube addons enable metrics-server
+          sleep 60
+          run kubectl top pods
+          e
+
+      - name: Step 26 - Cleanup
+        if: always()
+        run: |
+          source /tmp/h.sh
+          h "Step 26 - Cleanup"
+          kubectl delete -f Practical_13_Kubernetes/service.yaml --ignore-not-found 2>&1 | tee -a "$S"
+          kubectl delete deployment churn-prediction --ignore-not-found 2>&1 | tee -a "$S"
+          kubectl delete secret ghcr-secret --ignore-not-found 2>&1 | tee -a "$S"
+          e
