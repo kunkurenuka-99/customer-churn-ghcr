@@ -19,6 +19,11 @@ class Customer(BaseModel):
     OnlineSecurity: str
 
 
+@app.get("/")
+def root():
+    return {"message": "Customer Churn Prediction API is running", "version": "v1"}
+
+
 @app.get("/health")
 def health():
     return {"status": "ok"}
