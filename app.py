@@ -152,7 +152,8 @@ def root():
     return {"message": "Customer Churn Prediction API is running", "version": "v4-monitoring"}
 
 
-@app.get("/health")
+# TEMPORARY CI FAILURE DEMO: route renamed from /health to /healthz
+@app.get("/healthz")
 def health():
     return {"status": "ok"}
 
