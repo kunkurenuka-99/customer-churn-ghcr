@@ -5,6 +5,8 @@ on:
     branches: [main]
     paths-ignore:
       - "Practical_13_Kubernetes/**"
+      - "drift/**"
+      - ".github/workflows/drift-retraining.yml"
   workflow_dispatch:
     inputs:
       baseline_tag:
