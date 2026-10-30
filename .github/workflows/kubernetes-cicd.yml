@@ -211,7 +211,9 @@ jobs:
         run: |
           source /tmp/h.sh
           h "Verify health through the Kubernetes Service"
-          kubectl exec deployment/churn-prediction -- python -c "import urllib.request; print(urllib.request.urlopen('http://churn-prediction-service/health', timeout=10).read().decode())" 2>&1 | tee -a "$S"
+          echo "--- /health from a separate Pod through the Service ---" | tee -a "$S"
+          kubectl run health-check --rm -i --restart=Never --image=curlimages/curl:8.10.1 -- curl -fsS -m 10 http://churn-prediction-service/health 2>&1 | tee -a "$S"
+          echo | tee -a "$S"
           pf_start
           echo "--- GET /health ---" | tee -a "$S"
           curl -fsS -w '\nHTTP %{http_code}\n' localhost:8080/health 2>&1 | tee -a "$S"
@@ -247,3 +249,7 @@ jobs:
           run kubectl rollout status deployment/churn-prediction --timeout=180s
           run kubectl rollout history deployment/churn-prediction
           echo -n "Active image after rollback: " | tee -a "$S"
+          kubectl get deployment churn-prediction -o jsonpath="{.spec.template.spec.containers[0].image}" | tee -a "$S"
+          echo | tee -a "$S"
+          run kubectl get pods
+          e
