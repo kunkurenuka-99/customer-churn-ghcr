@@ -1,0 +1,149 @@
+name: Practical 15 - Data Drift Detection and Retraining
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Recent data batch to simulate (stable or drift)"
+        type: choice
+        options:
+          - stable
+          - drift
+        default: drift
+      labels_available:
+        description: "Ground-truth labels available for the recent batch?"
+        type: boolean
+        default: true
+      min_accuracy:
+        description: "Quality gate - minimum candidate accuracy"
+        required: true
+        default: "0.75"
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  drift-retraining:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      MODE: ${{ inputs.mode }}
+      LABELS: ${{ inputs.labels_available }}
+      MIN_ACC: ${{ inputs.min_accuracy }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install packages
+        run: pip install pandas numpy scipy scikit-learn joblib
+
+      - name: Step 1 - Create reference dataset
+        run: |
+          S="$GITHUB_STEP_SUMMARY"
+          {
+            echo "## Run settings"
+            echo "- mode: **$MODE**"
+            echo "- labels available: **$LABELS**"
+            echo "- minimum accuracy (quality gate): **$MIN_ACC**"
+            echo
+            echo "### Step 1 - Reference dataset"
+            echo '```'
+          } >> "$S"
+          rc=0
+          python drift/prepare_reference.py 2>&1 | tee -a "$S" || rc=$?
+          echo '```' >> "$S"
+          exit $rc
+
+      - name: Step 2 - Prepare recent production data
+        run: |
+          S="$GITHUB_STEP_SUMMARY"
+          ARGS="--mode $MODE"
+          if [ "$LABELS" = "true" ]; then ARGS="$ARGS --labels"; fi
+          { echo; echo "### Step 2 - Recent data batch"; echo '```'; } >> "$S"
+          rc=0
+          python drift/simulate_current_data.py $ARGS 2>&1 | tee -a "$S" || rc=$?
+          echo '```' >> "$S"
+          exit $rc
+
+      - name: Step 3 - Detect data drift
+        run: |
+          S="$GITHUB_STEP_SUMMARY"
+          python drift/detect_drift.py
+          python - <<'PY' >> "$S"
+          import json
+          r = json.load(open("drift/drift_report.json"))
+          print("\n### Step 3 - Drift report\n")
+          print("| Feature | Test | p-value | Drift? |")
+          print("|---|---|---|---|")
+          for name, v in r["features"].items():
+              print(f"| {name} | {v['test']} | {v['p_value']} | {'YES' if v['drift_detected'] else 'no'} |")
+          print(f"\n**Features flagged:** {r['drifted_feature_count']} (rule: at least {r['min_drifted_features']})")
+          print(f"\n**Overall drift: {r['overall_drift']}**")
+          print("\n" + ("Decision: drift detected, investigate and retrain." if r["overall_drift"] else "Decision: no overall drift, continue monitoring. No retraining."))
+          PY
+
+      - name: Step 7 - Retrain candidate (only if drift and labels exist)
+        run: |
+          S="$GITHUB_STEP_SUMMARY"
+          { echo; echo "### Step 7 - Retraining"; echo '```'; } >> "$S"
+          rc=0
+          python drift/retrain_candidate.py 2>&1 | tee -a "$S" || rc=$?
+          echo '```' >> "$S"
+          exit $rc
+
+      - name: Step 8 - Quality gate
+        run: |
+          S="$GITHUB_STEP_SUMMARY"
+          { echo; echo "### Step 8 - Quality gate"; echo '```'; } >> "$S"
+          rc=0
+          if [ -f drift/retraining_metrics.json ]; then
+            python drift/approve_candidate.py --min-accuracy "$MIN_ACC" 2>&1 | tee -a "$S" || rc=$?
+          else
+            echo "No candidate model was trained, so there is nothing to approve." | tee -a "$S"
+          fi
+          echo '```' >> "$S"
+          exit $rc
+
+      - name: Step 10 - Verify the approved model works
+        run: |
+          S="$GITHUB_STEP_SUMMARY"
+          { echo; echo "### Step 10 - Approved model check"; echo '```'; } >> "$S"
+          if [ -f drift/approved/churn_model_approved.joblib ]; then
+            python - <<'PY' 2>&1 | tee -a "$S"
+          import joblib
+          import pandas as pd
+          m = joblib.load("drift/approved/churn_model_approved.joblib")
+          print("Model loaded successfully:", type(m).__name__)
+          df = pd.DataFrame([{"gender": "Female", "SeniorCitizen": 0, "Partner": "Yes",
+                              "Dependents": "No", "tenure": 1, "PhoneService": "No",
+                              "MultipleLines": "No phone service", "InternetService": "DSL",
+                              "OnlineSecurity": "No"}])
+          print("Sample prediction (churn):", int(m.predict(df)[0]))
+          print("Churn probability:", round(float(m.predict_proba(df)[0][1]), 4))
+          PY
+          else
+            echo "No new model was approved. The existing deployed model is unchanged." | tee -a "$S"
+          fi
+          echo '```' >> "$S"
+
+      - name: Upload drift evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: drift-evidence
+          path: |
+            drift/*.csv
+            drift/*.json
+            drift/*.joblib
+            drift/approved/
+          if-no-files-found: warn
