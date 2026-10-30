@@ -44,6 +44,18 @@ jobs:
         run: |
           echo "image_ref=${REGISTRY}/${IMAGE_NAME}:sha-${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
 
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Train model (creates churn_model.joblib)
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          python train.py
+          ls -l churn_model.joblib
+
       - name: Build Docker image for testing
         run: |
           docker build -t customer-churn-prediction:test .
@@ -67,8 +79,6 @@ jobs:
 
       - name: Run existing automated tests
         run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
           if [ -d tests ]; then pytest -q; fi
 
       - name: Stop test container
@@ -156,7 +166,7 @@ jobs:
       - name: Recreate the Practical-13 baseline release
         run: |
           source /tmp/h.sh
-          BASE_IMAGE="${REGISTRY:-ghcr.io}/${IMAGE_NAME}:${BASELINE_TAG}"
+          BASE_IMAGE="${REGISTRY}/${IMAGE_NAME}:${BASELINE_TAG}"
           h "Baseline release (previous working version)"
           sed -E "s|^([[:space:]]*image:).*|\1 ${BASE_IMAGE}|" Practical_13_Kubernetes/deployment.yaml > /tmp/deployment.yaml
           run kubectl apply -f /tmp/deployment.yaml
@@ -180,7 +190,7 @@ jobs:
           source /tmp/h.sh
           TARGET="$NEW_IMAGE"
           if [ "$BREAK_DEPLOY" = "true" ]; then
-            TARGET="ghcr.io/${IMAGE_NAME}:sha-doesnotexist"
+            TARGET="${REGISTRY}/${IMAGE_NAME}:sha-doesnotexist"
             echo "SIMULATING A FAILED DEPLOYMENT with a nonexistent tag"
           fi
           h "Deploy the tested image (kubectl set image)"
@@ -237,7 +247,3 @@ jobs:
           run kubectl rollout status deployment/churn-prediction --timeout=180s
           run kubectl rollout history deployment/churn-prediction
           echo -n "Active image after rollback: " | tee -a "$S"
-          kubectl get deployment churn-prediction -o jsonpath="{.spec.template.spec.containers[0].image}" | tee -a "$S"
-          echo | tee -a "$S"
-          run kubectl get pods
-          e
