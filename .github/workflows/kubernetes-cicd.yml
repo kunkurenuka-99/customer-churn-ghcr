@@ -1,0 +1,243 @@
+name: Customer Churn Prediction - Kubernetes CI/CD
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - "Practical_13_Kubernetes/**"
+  workflow_dispatch:
+    inputs:
+      baseline_tag:
+        description: "Image tag used as the starting (previous) release"
+        required: false
+        default: "sha-d2a9944dd75c24e55aa7f54650132d3b9d618986"
+      break_deploy:
+        description: "Simulate a failed deployment to demonstrate automatic rollback"
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: kunkurenuka-99/customer-churn-prediction
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build-test-push:
+    runs-on: ubuntu-latest
+    outputs:
+      image_ref: ${{ steps.image.outputs.image_ref }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Create immutable image reference
+        id: image
+        run: |
+          echo "image_ref=${REGISTRY}/${IMAGE_NAME}:sha-${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+
+      - name: Build Docker image for testing
+        run: |
+          docker build -t customer-churn-prediction:test .
+
+      - name: Start test container
+        run: |
+          docker run -d --name churn-test -p 8000:8000 customer-churn-prediction:test
+
+      - name: Wait for health endpoint
+        run: |
+          for i in {1..30}; do
+            if curl -fsS http://127.0.0.1:8000/health; then
+              echo
+              echo "Container health test passed"
+              exit 0
+            fi
+            sleep 2
+          done
+          docker logs churn-test
+          exit 1
+
+      - name: Run existing automated tests
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          if [ -d tests ]; then pytest -q; fi
+
+      - name: Stop test container
+        if: always()
+        run: docker rm -f churn-test || true
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Tag tested image
+        run: |
+          docker tag customer-churn-prediction:test ${REGISTRY}/${IMAGE_NAME}:sha-${GITHUB_SHA}
+          docker tag customer-churn-prediction:test ${REGISTRY}/${IMAGE_NAME}:latest
+
+      - name: Push tested image to GHCR
+        run: |
+          docker push ${REGISTRY}/${IMAGE_NAME}:sha-${GITHUB_SHA}
+          docker push ${REGISTRY}/${IMAGE_NAME}:latest
+
+      - name: CI summary
+        run: |
+          {
+            echo "### CI result (build-test-push)"
+            echo '```'
+            echo "Commit SHA     : ${GITHUB_SHA}"
+            echo "Image published: ${REGISTRY}/${IMAGE_NAME}:sha-${GITHUB_SHA}"
+            echo "Also tagged    : ${REGISTRY}/${IMAGE_NAME}:latest"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  deploy-kubernetes:
+    needs: build-test-push
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      NEW_IMAGE: ${{ needs.build-test-push.outputs.image_ref }}
+      BASELINE_TAG: ${{ inputs.baseline_tag || 'sha-d2a9944dd75c24e55aa7f54650132d3b9d618986' }}
+      BREAK_DEPLOY: ${{ inputs.break_deploy }}
+      PAYLOAD: '{"gender":"Female","SeniorCitizen":0,"Partner":"Yes","Dependents":"No","tenure":1,"PhoneService":"No","MultipleLines":"No phone service","InternetService":"DSL","OnlineSecurity":"No"}'
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Prepare helpers
+        run: |
+          cat > /tmp/h.sh <<'EOF'
+          S="$GITHUB_STEP_SUMMARY"
+          h(){ { echo; echo "### $1"; echo '```'; } >> "$S"; echo "===== $1 ====="; }
+          e(){ echo '```' >> "$S"; }
+          run(){ echo "\$ $*" | tee -a "$S"; "$@" 2>&1 | tee -a "$S"; }
+          pf_start(){ kubectl port-forward svc/churn-prediction-service 8080:80 >/tmp/pf.log 2>&1 & PF=$!; sleep 6; }
+          pf_stop(){ kill "$PF" 2>/dev/null || true; }
+          EOF
+
+      - name: Start Minikube cluster
+        uses: medyagh/setup-minikube@latest
+        with:
+          driver: docker
+
+      - name: Verify Kubernetes cluster
+        run: |
+          source /tmp/h.sh
+          h "Verify Kubernetes cluster"
+          run kubectl config current-context
+          run kubectl get nodes
+          e
+
+      - name: Registry access for GHCR (token hidden)
+        env:
+          GH_TOKEN_VALUE: ${{ secrets.GITHUB_TOKEN }}
+          GH_USER: ${{ github.actor }}
+        run: |
+          kubectl create secret docker-registry ghcr-secret \
+            --docker-server=ghcr.io \
+            --docker-username="$GH_USER" \
+            --docker-password="$GH_TOKEN_VALUE" \
+            --docker-email="noreply@github.com" > /dev/null
+          kubectl patch serviceaccount default -p '{"imagePullSecrets":[{"name":"ghcr-secret"}]}' > /dev/null
+
+      - name: Recreate the Practical-13 baseline release
+        run: |
+          source /tmp/h.sh
+          BASE_IMAGE="${REGISTRY:-ghcr.io}/${IMAGE_NAME}:${BASELINE_TAG}"
+          h "Baseline release (previous working version)"
+          sed -E "s|^([[:space:]]*image:).*|\1 ${BASE_IMAGE}|" Practical_13_Kubernetes/deployment.yaml > /tmp/deployment.yaml
+          run kubectl apply -f /tmp/deployment.yaml
+          run kubectl apply -f Practical_13_Kubernetes/service.yaml
+          run kubectl rollout status deployment/churn-prediction --timeout=240s
+          run kubectl get pods
+          e
+
+      - name: Show current deployment image
+        run: |
+          source /tmp/h.sh
+          h "Current deployment image (before CD)"
+          echo -n "Current image: " | tee -a "$S"
+          kubectl get deployment churn-prediction -o jsonpath="{.spec.template.spec.containers[0].image}" | tee -a "$S"
+          echo | tee -a "$S"
+          e
+
+      - name: Deploy the tested image
+        id: setimage
+        run: |
+          source /tmp/h.sh
+          TARGET="$NEW_IMAGE"
+          if [ "$BREAK_DEPLOY" = "true" ]; then
+            TARGET="ghcr.io/${IMAGE_NAME}:sha-doesnotexist"
+            echo "SIMULATING A FAILED DEPLOYMENT with a nonexistent tag"
+          fi
+          h "Deploy the tested image (kubectl set image)"
+          echo "Target image: $TARGET" | tee -a "$S"
+          run kubectl set image deployment/churn-prediction churn-api="$TARGET"
+          e
+
+      - name: Wait for Kubernetes rollout
+        run: |
+          source /tmp/h.sh
+          h "Wait for Kubernetes rollout"
+          TO=180s
+          if [ "$BREAK_DEPLOY" = "true" ]; then TO=90s; fi
+          run kubectl rollout status deployment/churn-prediction --timeout=$TO
+          e
+
+      - name: Verify health through the Kubernetes Service
+        run: |
+          source /tmp/h.sh
+          h "Verify health through the Kubernetes Service"
+          kubectl exec deployment/churn-prediction -- python -c "import urllib.request; print(urllib.request.urlopen('http://churn-prediction-service/health', timeout=10).read().decode())" 2>&1 | tee -a "$S"
+          pf_start
+          echo "--- GET /health ---" | tee -a "$S"
+          curl -fsS -w '\nHTTP %{http_code}\n' localhost:8080/health 2>&1 | tee -a "$S"
+          echo "--- POST /predict ---" | tee -a "$S"
+          curl -fsS -w '\nHTTP %{http_code}\n' -X POST localhost:8080/predict -H 'Content-Type: application/json' -d "$PAYLOAD" 2>&1 | tee -a "$S"
+          echo "--- GET /metrics ---" | tee -a "$S"
+          curl -sS -o /dev/null -w 'HTTP %{http_code}\n' localhost:8080/metrics 2>&1 | tee -a "$S"
+          curl -sS localhost:8080/metrics | grep '^churn_api_' | head -n 6 | tee -a "$S" || true
+          pf_stop
+          e
+
+      - name: Show deployed image, Pods and traceability
+        run: |
+          source /tmp/h.sh
+          h "Deployed image, Pods and release traceability"
+          run kubectl get deployment churn-prediction -o wide
+          run kubectl get pods -o wide
+          run kubectl rollout history deployment/churn-prediction
+          echo "Git commit SHA : ${GITHUB_SHA}" | tee -a "$S"
+          echo "Expected image : ${NEW_IMAGE}" | tee -a "$S"
+          echo -n "Running image  : " | tee -a "$S"
+          kubectl get deployment churn-prediction -o jsonpath="{.spec.template.spec.containers[0].image}" | tee -a "$S"
+          echo | tee -a "$S"
+          e
+
+      - name: Roll back if deployment verification fails
+        if: failure() && steps.setimage.outcome == 'success'
+        run: |
+          source /tmp/h.sh
+          h "AUTOMATIC ROLLBACK (deployment verification failed)"
+          run kubectl get pods
+          run kubectl rollout undo deployment/churn-prediction
+          run kubectl rollout status deployment/churn-prediction --timeout=180s
+          run kubectl rollout history deployment/churn-prediction
+          echo -n "Active image after rollback: " | tee -a "$S"
+          kubectl get deployment churn-prediction -o jsonpath="{.spec.template.spec.containers[0].image}" | tee -a "$S"
+          echo | tee -a "$S"
+          run kubectl get pods
+          e
