@@ -1,0 +1,55 @@
+name: Practical 8 - Publish image to GHCR
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  PORT: 8000
+  HEALTH_PATH: /health
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set image name
+        run: echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/customer-churn-ghcr" >> $GITHUB_ENV
+
+      - name: Build image
+        run: |
+          docker build \
+            --label org.opencontainers.image.source=https://github.com/${{ github.repository }} \
+            -t $IMAGE:v1 -t $IMAGE:latest .
+          docker images
+
+      - name: Test container
+        run: |
+          docker run -d --name check -p $PORT:$PORT $IMAGE:v1
+          sleep 20
+          docker ps
+          curl --fail http://localhost:$PORT$HEALTH_PATH
+          docker stop check
+
+      - name: Login to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+
+      - name: Push v1 and latest
+        run: |
+          docker push $IMAGE:v1
+          docker push $IMAGE:latest
+
+      - name: Pull and re-test from GHCR
+        run: |
+          docker rmi $IMAGE:v1 $IMAGE:latest
+          docker pull $IMAGE:v1
+          docker run -d --name from-ghcr -p $PORT:$PORT $IMAGE:v1
+          sleep 20
+          docker ps
+          curl --fail http://localhost:$PORT$HEALTH_PATH
+          docker inspect $IMAGE:v1 --format '{{.RepoDigests}}'
+          docker stop from-ghcr
