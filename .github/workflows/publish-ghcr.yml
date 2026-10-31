@@ -17,6 +17,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Train the model
+        run: |
+          pip install -r requirements.txt
+          python train.py
+          ls -la churn_model.joblib
+
       - name: Set image name
         run: echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/customer-churn-ghcr" >> $GITHUB_ENV
 
